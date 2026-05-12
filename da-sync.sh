@@ -7,10 +7,12 @@
 #    1. Finds today's DA backup folder
 #    2. Uploads all archives to remote SFTP
 #    3. Deletes old local/remote backup folders (retention)
+#    4. Sends Telegram notification with summary
 #
 #  Requirements:
 #    - sshpass  (yum install sshpass -y)
 #    - sftp     (included in openssh-clients)
+#    - curl     (for Telegram notifications)
 #
 #  Setup:
 #    1. Edit the CONFIG section below
@@ -62,6 +64,25 @@ KEEP_REMOTE=14   # remote SFTP   — 14 days
 # Log file path
 LOG_FILE="/var/log/da-sync.log"
 
+# ── Telegram Notifications ────────────────────────────────────
+# Set TELEGRAM_ENABLED=true and fill in your bot token + chat ID
+# Leave TELEGRAM_ENABLED=false to disable
+#
+# How to set up:
+#   1. Message @BotFather on Telegram → /newbot → copy the token
+#   2. Add your bot to a group, or get your personal chat ID via:
+#      curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
+#   3. Use single quotes for TELEGRAM_BOT_TOKEN if it has special chars
+#
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN='your-bot-token'
+TELEGRAM_CHAT_ID='your-chat-id'
+
+# What events trigger a Telegram message:
+TELEGRAM_ON_SUCCESS=true   # notify when all files sync successfully
+TELEGRAM_ON_FAILURE=true   # notify when any file fails to upload
+TELEGRAM_ON_SKIP=false     # notify when all files were already synced (skipped)
+
 # ============================================================
 #  END CONFIG — do not edit below this line
 # ============================================================
@@ -72,10 +93,42 @@ DRY_RUN=false
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
-die() { log "ERROR: $*"; exit 1; }
+die() { log "ERROR: $*"; tg_notify "error" "❌ DA-Sync ERROR on $(hostname)" "$*"; exit 1; }
 
 TMPBATCH=$(mktemp /tmp/da-sync-batch.XXXXXX)
 trap 'rm -f "$TMPBATCH"' EXIT
+
+START_TIME=$SECONDS
+
+# ── Telegram notification function ────────────────────────────
+tg_notify() {
+  # $1 = type (success/failure/skip/error)
+  # $2 = title
+  # $3 = message body
+  [[ "$TELEGRAM_ENABLED" != "true" ]] && return 0
+  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+  command -v curl &>/dev/null || { log "WARN: curl not found, skipping Telegram notify"; return 0; }
+
+  local type="$1" title="$2" body="$3"
+
+  # Check per-event toggles
+  case "$type" in
+    success) [[ "$TELEGRAM_ON_SUCCESS" != "true" ]] && return 0 ;;
+    failure) [[ "$TELEGRAM_ON_FAILURE" != "true" ]] && return 0 ;;
+    skip)    [[ "$TELEGRAM_ON_SKIP"    != "true" ]] && return 0 ;;
+    error)   [[ "$TELEGRAM_ON_FAILURE" != "true" ]] && return 0 ;;
+  esac
+
+  local text
+  text=$(printf '%s\n%s' "$title" "$body")
+
+  curl -s --max-time 10 \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    -d "parse_mode=HTML" \
+    --data-urlencode "text=${text}" \
+    >> "$LOG_FILE" 2>&1 || log "WARN: Telegram notification failed (non-fatal)"
+}
 
 # ── Dependency check ──────────────────────────────────────────
 command -v sshpass &>/dev/null || die "sshpass not installed. Run: yum install sshpass -y"
@@ -136,6 +189,8 @@ log "Files   : ${#FILES[@]}"
 $DRY_RUN && log "DRY-RUN mode — no files will be transferred or deleted"
 
 SYNCED=0; SKIPPED=0; ERRORS=0
+FAILED_FILES=()
+SYNCED_FILES=()
 
 # Create remote dated folder once (- prefix tells sftp to ignore errors)
 if ! $DRY_RUN; then
@@ -158,16 +213,20 @@ for FILE in "${FILES[@]}"; do
 
   if $DRY_RUN; then
     log "DRY-RUN: would upload $FNAME → ${REMOTE_DIR}/${FNAME}"
-    SYNCED=$(( SYNCED + 1 )); continue
+    SYNCED=$(( SYNCED + 1 ))
+    SYNCED_FILES+=("$FNAME ($FSIZE)")
+    continue
   fi
 
   if sftp_batch "put ${FILE} ${REMOTE_DIR}/${FNAME}"; then
     touch "$MARKER"
     log "OK: $FNAME"
     SYNCED=$(( SYNCED + 1 ))
+    SYNCED_FILES+=("$FNAME ($FSIZE)")
   else
     log "FAILED: $FNAME — will retry on next run"
     ERRORS=$(( ERRORS + 1 ))
+    FAILED_FILES+=("$FNAME")
   fi
 done
 
@@ -216,9 +275,66 @@ if ! $DRY_RUN; then
 fi
 
 # ── Summary ───────────────────────────────────────────────────
+DURATION=$(( SECONDS - START_TIME ))
+
 log "========================================"
 log "Done — Synced: $SYNCED | Skipped: $SKIPPED | Errors: $ERRORS"
+log "Duration: ${DURATION}s"
 log "========================================"
+
+# ── Telegram summary ──────────────────────────────────────────
+if [[ "$TELEGRAM_ENABLED" == "true" ]] && ! $DRY_RUN; then
+
+  SERVER="$(hostname)"
+  DATE="$(date '+%Y-%m-%d')"
+
+  if [[ $ERRORS -gt 0 && $SYNCED -eq 0 ]]; then
+    # All failed
+    FAILED_LIST=""
+    for f in "${FAILED_FILES[@]}"; do
+      FAILED_LIST="${FAILED_LIST}  • ${f}\n"
+    done
+    tg_notify "failure" \
+      "❌ Backup Sync FAILED — ${SERVER}" \
+      "$(printf '<b>Date:</b> %s\n<b>Host:</b> %s\n<b>Remote:</b> %s:%s\n\n<b>Failed files:</b>\n%s\n<b>Duration:</b> %ss\n\n<i>HostRainbow — hostrainbow.in</i>' \
+        "$DATE" "$SERVER" "$SFTP_HOST" "$REMOTE_DIR" "$FAILED_LIST" "$DURATION")"
+
+  elif [[ $ERRORS -gt 0 && $SYNCED -gt 0 ]]; then
+    # Partial success
+    FAILED_LIST=""
+    for f in "${FAILED_FILES[@]}"; do
+      FAILED_LIST="${FAILED_LIST}  • ${f}\n"
+    done
+    SYNCED_LIST=""
+    for f in "${SYNCED_FILES[@]}"; do
+      SYNCED_LIST="${SYNCED_LIST}  • ${f}\n"
+    done
+    tg_notify "failure" \
+      "⚠️ Backup Sync PARTIAL — ${SERVER}" \
+      "$(printf '<b>Date:</b> %s\n<b>Host:</b> %s\n<b>Remote:</b> %s:%s\n\n<b>✅ Synced (%s):</b>\n%s\n<b>❌ Failed (%s):</b>\n%s\n<b>Duration:</b> %ss\n\n<i>HostRainbow — hostrainbow.in</i>' \
+        "$DATE" "$SERVER" "$SFTP_HOST" "$REMOTE_DIR" \
+        "$SYNCED" "$SYNCED_LIST" "$ERRORS" "$FAILED_LIST" "$DURATION")"
+
+  elif [[ $SYNCED -eq 0 && $SKIPPED -gt 0 ]]; then
+    # All skipped
+    tg_notify "skip" \
+      "⏭️ Backup Sync Skipped — ${SERVER}" \
+      "$(printf '<b>Date:</b> %s\n<b>Host:</b> %s\n\nAll %s file(s) already synced from a previous run.\n\n<i>HostRainbow — hostrainbow.in</i>' \
+        "$DATE" "$SERVER" "$SKIPPED")"
+
+  else
+    # Full success
+    SYNCED_LIST=""
+    for f in "${SYNCED_FILES[@]}"; do
+      SYNCED_LIST="${SYNCED_LIST}  • ${f}\n"
+    done
+    tg_notify "success" \
+      "✅ Backup Sync OK — ${SERVER}" \
+      "$(printf '<b>Date:</b> %s\n<b>Host:</b> %s\n<b>Remote:</b> %s:%s\n\n<b>Files synced (%s):</b>\n%s\n<b>Retention:</b> Local %sd / Remote %sd\n<b>Duration:</b> %ss\n\n<i>HostRainbow — hostrainbow.in</i>' \
+        "$DATE" "$SERVER" "$SFTP_HOST" "$REMOTE_DIR" \
+        "$SYNCED" "$SYNCED_LIST" "$KEEP_LOCAL" "$KEEP_REMOTE" "$DURATION")"
+  fi
+fi
 
 [[ $ERRORS -gt 0 ]] && exit 1
 exit 0
